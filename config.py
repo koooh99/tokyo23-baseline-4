@@ -123,6 +123,24 @@ DEFAULT_LAG_COLS = LAG_CONFIGS_Q[DEFAULT_LAG_NAME]
 DEFAULT_TLAG_COLS = ["Lag_q1_AvgPrice", "Lag_q4_AvgPrice"]      # 自町の過去（時間ラグ）
 DEFAULT_SLAG_COLS = ["S_Lag_q1_AvgPrice", "S_Lag_q4_AvgPrice"]  # 近隣の過去（空間ラグ）
 
+# --- 時空間GNN（09, 最小スタート） ---------------------------------
+# 方針: 04qの町丁目queen隣接(940町)をグラフ化し、各四半期スナップショットに
+#       空間GCNを適用 → 学習した空間表現を物件特徴と結合して平米単価を回帰する。
+#       手作りS-lag（近隣平均）を「グラフ伝播」に置き換えて勝てるかを見る v0。
+# 時間方向は当面 Expanding Window(四半期) で表現し、直近性重視の系列モデルは次段で足す。
+# ノード特徴は町丁目×四半期で持つ自町ラグ（直前1Q/前年同期）＋重心座標。
+GNN_NODE_FEATURES = ["Lag_q1_AvgPrice", "Lag_q4_AvgPrice", "centroid_x", "centroid_y"]
+# 物件側の数値特徴（駅TEは最小版では使わず、グラフの寄与を切り分ける）。
+GNN_PROP_FEATURES = ["Age", "Area_num", "Is_Renovated", "Is_RC", "Rooms",
+                     "FAR_CAR_ratio", "Station_min"]
+# CPUで現実的に回すため、まず直近8四半期(2024Q1〜2025Q4)だけで検証。
+GNN_TEST_QUARTERS = [y * 4 + q for y in range(2024, 2026) for q in range(4)]
+GNN_TRAIN_WINDOW = 12         # 各フォールドで使う直近の訓練四半期数（None=全期間）
+GNN_HIDDEN = 32               # GCN隠れ次元
+GNN_EPOCHS = 40
+GNN_LR = 1e-3
+GNN_DEVICE = "cpu"            # MPSはハングし得るためCPU既定（環境変数 GNN_DEVICE で上書き）
+
 # --- 外れ値処理（議事録：慎重に・論文で明示） ----------------------
 # 2段階に分ける：
 #  (A) 決定論的クレンジング … 02で実施。価格0や面積欠損など「あり得ない/計算不能」を除去。
