@@ -148,6 +148,10 @@ GNN_DEVICE = "cpu"            # MPSはハングし得るためCPU既定（環境
 TEMPORAL_SEQ_LEN = 8          # GRUに入れる直近四半期数
 TEMPORAL_EPOCHS = 30          # 四半期ごとにstepする（=エポックあたり訓練四半期数の更新）
 TEMPORAL_LR = 3e-3
+# (c) 公平比較: XGB-full(Qboth) と同じ立地系特徴を物件側ヘッドにも入れる。
+# Station_TE（駅名ターゲットエンコーディング, フォールド内fitでリーク防止）＋
+# Municipality / Zoning の one-hot を結合する。Falseで最小版（グラフ＋物件数値のみ）。
+GNN_RICH_FEATURES = True
 
 # --- 外れ値処理（議事録：慎重に・論文で明示） ----------------------
 # 2段階に分ける：

@@ -29,12 +29,15 @@ torch.manual_seed(C.RANDOM_STATE)
 np.random.seed(C.RANDOM_STATE)
 
 FULL_EVAL = bool(os.environ.get("GNN_FULL_EVAL"))
+RICH = C.GNN_RICH_FEATURES
 TEST_QUARTERS = C.EXPANDING_TEST_QUARTERS if FULL_EVAL else C.GNN_TEST_QUARTERS
-OUT_NAME = "gnn_temporal_q_full.csv" if FULL_EVAL else "gnn_temporal_q.csv"
+_stem = "gnn_temporal_rich" if RICH else "gnn_temporal"
+OUT_NAME = _stem + ("_q_full.csv" if FULL_EVAL else "_q.csv")
+GNN_LABEL = "GNN-temporal+feat" if RICH else "GNN-temporal(GRU)"
 L = C.TEMPORAL_SEQ_LEN
 
 print(f"=== 10. 時空間GNN・時間系列版 (GCN+GRU, L={L}, device={DEVICE}, "
-      f"{'全64四半期' if FULL_EVAL else '直近8四半期'}={len(TEST_QUARTERS)}fold) ===")
+      f"rich={RICH}, {'全64四半期' if FULL_EVAL else '直近8四半期'}={len(TEST_QUARTERS)}fold) ===")
 df = pd.read_csv(C.DATA_DIR / "tokyo23_model_table_q.csv")
 df = df.dropna(subset=[C.TARGET, "Qidx"]).copy()
 df["Qidx"] = df["Qidx"].astype(int)
@@ -93,22 +96,38 @@ def train_eval_temporal(train_t, test_q, train_df, test_df):
                      | set(train_t) | {test_q})
     need_ts = [t for t in need_ts if qmin <= t <= qmax]
     node_std = Standardizer().fit(np.vstack([raw_node_feat(t) for t in train_t]))
-    prop_std = Standardizer().fit(train_df[PROP].to_numpy(dtype=float))
     y_mean = train_df[C.TARGET].mean(); y_std = train_df[C.TARGET].std() or 1.0
+
+    # (c) 立地系特徴を物件ヘッドに追加（XGB-fullと同条件にする）。すべて訓練のみでfit。
+    num_cols = list(PROP)
+    cat_cols, ohe = [], None
+    if RICH:
+        if C.STATION_TE:                       # 駅名TE（フォールド内fit＝リーク防止）
+            ste = StationTargetEncoder(C.TARGET, m=C.TE_SMOOTHING).fit(train_df)
+            train_df = ste.transform(train_df); test_df = ste.transform(test_df)
+            num_cols = num_cols + ["Station_TE"]
+        cat_cols = ["Municipality"] + [c for c in C.CAT_FEATURES if c in train_df.columns]
+        ohe = OneHotEncoder(handle_unknown="ignore").fit(train_df[cat_cols])
+    prop_std = Standardizer().fit(train_df[num_cols].to_numpy(dtype=float))
+    cat_dim = sum(len(c) for c in ohe.categories_) if ohe is not None else 0
 
     Xstd = {t: torch.tensor(node_std.transform(raw_node_feat(t)),
                             dtype=torch.float32, device=DEVICE) for t in need_ts}
 
     def prop_pack(rows):
+        num = prop_std.transform(rows[num_cols].to_numpy(dtype=float))
+        if ohe is not None:
+            cat = ohe.transform(rows[cat_cols])
+            cat = cat.toarray() if hasattr(cat, "toarray") else cat
+            num = np.concatenate([num, cat], axis=1)
         return (torch.tensor(rows["node"].to_numpy(), dtype=torch.long, device=DEVICE),
-                torch.tensor(prop_std.transform(rows[PROP].to_numpy(dtype=float)),
-                             dtype=torch.float32, device=DEVICE),
+                torch.tensor(num, dtype=torch.float32, device=DEVICE),
                 torch.tensor((rows[C.TARGET].to_numpy() - y_mean) / y_std,
                              dtype=torch.float32, device=DEVICE))
     train_packs = {t: prop_pack(train_df[train_df["Qidx"] == t]) for t in train_t}
     test_pack = prop_pack(test_df)
 
-    model = SpatioTemporalGNN(n_node_feat=4, n_prop_feat=len(PROP),
+    model = SpatioTemporalGNN(n_node_feat=4, n_prop_feat=len(num_cols) + cat_dim,
                               hidden=C.GNN_HIDDEN).to(DEVICE)
     opt = torch.optim.Adam(model.parameters(), lr=C.TEMPORAL_LR)
     loss_fn = torch.nn.MSELoss()
@@ -164,7 +183,7 @@ for q in TEST_QUARTERS:
                             "r2_trim": np.nan})
 
 temp_sum = summarize(pd.DataFrame(records))
-temp_sum.insert(0, "model", "GNN-temporal(GRU)")
+temp_sum.insert(0, "model", GNN_LABEL)
 
 # --- XGB-full(Qboth) 参照（同一フォールド） -----------------------
 ONEHOT = ["Municipality"] + [c for c in C.CAT_FEATURES if c in df.columns]
@@ -189,15 +208,20 @@ print(f"\n[全体R² 比較（同一フォールド: {len(TEST_QUARTERS)}四半�
 print(summary[summary["scope"] == "ALL"]
       [["model", "r2_mean", "r2_std", "r2_min", "r2_max", "n_folds"]]
       .round(3).to_string(index=False))
-# 09(静的GCN v0)の同一フォールド結果があれば併記
-v0_path = C.OUT_DIR / ("gnn_vs_xgb_q_full.csv" if FULL_EVAL else "gnn_vs_xgb_q.csv")
-if v0_path.exists():
-    v0 = pd.read_csv(v0_path)
-    row = v0[(v0["scope"] == "ALL") & (v0["model"] == "GNN(min v0)")]
+# 同一フォールドの既存結果を併記（静的GCN v0 / 最小特徴の時系列版）
+def _ref(path, model_name, label):
+    p = C.OUT_DIR / path
+    if not p.exists():
+        return
+    d = pd.read_csv(p)
+    row = d[(d["scope"] == "ALL") & (d["model"] == model_name)]
     if not row.empty:
         r = row.iloc[0]
-        print(f"  [参考] GNN(min v0, 静的GCN/09): "
-              f"{r['r2_mean']:.3f} ± {r['r2_std']:.3f}")
+        print(f"  [参考] {label}: {r['r2_mean']:.3f} ± {r['r2_std']:.3f}")
+
+suf = "_q_full.csv" if FULL_EVAL else "_q.csv"
+_ref("gnn_vs_xgb" + suf, "GNN(min v0)", "GNN 静的GCN v0 (09)")
+_ref("gnn_temporal" + suf, "GNN-temporal(GRU)", "GNN-temporal 最小特徴 (10, rich=False)")
 print("\n[サブグループ別 平均R²]")
 print(summary[summary["scope"] == "GROUP"][["model", "name", "r2_mean", "r2_std"]]
       .round(3).to_string(index=False))
