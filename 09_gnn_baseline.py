@@ -30,7 +30,14 @@ DEVICE = os.environ.get("GNN_DEVICE", C.GNN_DEVICE)
 torch.manual_seed(C.RANDOM_STATE)
 np.random.seed(C.RANDOM_STATE)
 
-print(f"=== 9. 時空間GNN (最小v0, device={DEVICE}) ===")
+# 既定は直近8四半期(GNN_TEST_QUARTERS)。GNN_FULL_EVAL=1 で全64四半期(2010Q1〜2025Q4)を
+# 評価し、頑健性を確認する。出力ファイルもモードで分ける。
+FULL_EVAL = bool(os.environ.get("GNN_FULL_EVAL"))
+TEST_QUARTERS = C.EXPANDING_TEST_QUARTERS if FULL_EVAL else C.GNN_TEST_QUARTERS
+OUT_NAME = "gnn_vs_xgb_q_full.csv" if FULL_EVAL else "gnn_vs_xgb_q.csv"
+
+print(f"=== 9. 時空間GNN (最小v0, device={DEVICE}, "
+      f"{'全64四半期' if FULL_EVAL else '直近8四半期'}={len(TEST_QUARTERS)}fold) ===")
 df = pd.read_csv(C.DATA_DIR / "tokyo23_model_table_q.csv")
 df = df.dropna(subset=[C.TARGET, "Qidx"]).copy()
 df["Qidx"] = df["Qidx"].astype(int)
@@ -73,7 +80,7 @@ def node_matrix(q):
 
 # --- GNN: 四半期フォールドで Expanding Window ----------------------
 gnn_records = []
-for q in C.GNN_TEST_QUARTERS:
+for q in TEST_QUARTERS:
     if q not in lag_by_q:
         continue
     win = C.GNN_TRAIN_WINDOW
@@ -136,7 +143,7 @@ def run_xgb(num_feats, onehot, use_te, tag):
     mk = lambda: Pipeline([("pre", pre), ("reg", xgb.XGBRegressor(**C.XGB_PARAMS))])
     ft = StationTargetEncoder(C.TARGET, m=C.TE_SMOOTHING) if use_te else None
     rec, _ = expanding_window_pooled(
-        df, mk, (onehot or []) + num_feats, C.TARGET, C.GNN_TEST_QUARTERS,
+        df, mk, (onehot or []) + num_feats, C.TARGET, TEST_QUARTERS,
         iqr_trim=C.IQR_TRIM, iqr_k=C.IQR_K, iqr_by_ward=C.IQR_BY_WARD,
         subgroups=subgroups, fold_transform=ft, time_col="Qidx", progress=False)
     s = summarize(rec); s.insert(0, "model", tag)
@@ -149,10 +156,10 @@ xgb_full = run_xgb(C.BASE_FEATURES + C.DEFAULT_LAG_COLS + ["Station_TE"],
 xgb_propT = run_xgb(PROP + C.DEFAULT_TLAG_COLS, [], False, "XGB-propT(自町T-lagのみ)")
 
 summary = pd.concat([gnn_sum, xgb_full, xgb_propT], ignore_index=True)
-out = C.OUT_DIR / "gnn_vs_xgb_q.csv"
+out = C.OUT_DIR / OUT_NAME
 summary.to_csv(out, index=False, encoding="utf-8-sig")
 
-print("\n[全体R² 比較（同一の直近四半期フォールド）]")
+print(f"\n[全体R² 比較（同一フォールド: {len(TEST_QUARTERS)}四半期）]")
 view = summary[summary["scope"] == "ALL"][
     ["model", "r2_mean", "r2_std", "r2_min", "r2_max", "n_folds"]].round(3)
 print(view.to_string(index=False))
