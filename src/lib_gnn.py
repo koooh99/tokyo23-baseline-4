@@ -12,6 +12,8 @@ import torch
 import torch.nn as nn
 from torch_geometric.nn import GCNConv
 
+from lib_temporal import build_aggregator
+
 
 def build_graph(node_keys, neighbors):
     """node_keys: [(Municipality, DistrictName), ...]（データに出現する町の順序）。
@@ -51,16 +53,23 @@ class SpatioGCN(nn.Module):
 
 
 class SpatioTemporalGNN(nn.Module):
-    """各時点に2層GCN(重み共有)で空間表現を作り、直近Lステップの系列をGRUで時間集約。
-    GRUが「どの過去四半期を重視するか（=直近性 vs 季節性）」を学習する。
+    """各時点に2層GCN(重み共有)で空間表現を作り、直近Lステップの系列を
+    時間集約器(lib_temporal)で1つの町表現に畳む。集約器を差し替えることで
+    「どの過去四半期を重視するか」の学習方法（GRU / 注意 / 平均 / 直前）を比較できる。
     最終の町表現を物件特徴と結合してMLPで平米単価を回帰する。
     使い方: encode()で各時点のH[N,hidden]を作り（1エポックで使い回す）、
-    temporal()で系列H[L,N,hidden]→h[N,hidden]、predict()で物件回帰。"""
-    def __init__(self, n_node_feat, n_prop_feat, hidden=32):
+    temporal()で系列H[L,N,hidden]→h[N,hidden]、predict()で物件回帰。
+
+    aggregator: 時間集約器の指定。文字列("gru"/"attention"/"mean"/"last")・
+        hidden→Module の factory・構築済みModule のいずれか。既定 "gru" は
+        旧実装(GRU直書き)と同一計算・同一パラメータ初期化順で、既知値を再現する。
+        ※GRU初期化のRNG順を旧実装(g1,g2,gru,head)に合わせるため、集約器は
+          __init__ 内の「g1,g2 の後・head の前」で build する。"""
+    def __init__(self, n_node_feat, n_prop_feat, hidden=32, aggregator="gru"):
         super().__init__()
         self.g1 = GCNConv(n_node_feat, hidden)
         self.g2 = GCNConv(hidden, hidden)
-        self.gru = nn.GRU(hidden, hidden)        # 入力 [L, N, hidden]（Nをバッチ扱い）
+        self.aggregator = build_aggregator(aggregator, hidden)
         self.head = nn.Sequential(
             nn.Linear(hidden + n_prop_feat, hidden), nn.ReLU(),
             nn.Linear(hidden, 1),
@@ -71,8 +80,7 @@ class SpatioTemporalGNN(nn.Module):
         return torch.relu(self.g2(h, edge_index))           # [N, hidden]
 
     def temporal(self, h_seq):
-        _, h_n = self.gru(h_seq)                             # h_seq [L,N,hidden]
-        return h_n[-1]                                       # [N, hidden]
+        return self.aggregator(h_seq)                        # [L,N,hidden] → [N,hidden]
 
     def predict(self, h, prop_node_idx, prop_feat):
         z = torch.cat([h[prop_node_idx], prop_feat], dim=1)

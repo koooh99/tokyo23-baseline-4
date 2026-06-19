@@ -145,9 +145,13 @@ GNN_DEVICE = "cpu"            # MPSはハングし得るためCPU既定（環境
 # 各町の「直近LQの観測平米単価系列」を GCN→GRU で集約し、直近性を学習させる。
 # ノード特徴は観測平米単価(前方補完)＋観測フラグ＋重心。系列長は直近性/季節性を
 # 両方カバーするよう既定8四半期(=2年, 前年同期も含む)。
-TEMPORAL_SEQ_LEN = 8          # GRUに入れる直近四半期数
+TEMPORAL_SEQ_LEN = 8          # 時間集約に入れる直近四半期数
 TEMPORAL_EPOCHS = 30          # 四半期ごとにstepする（=エポックあたり訓練四半期数の更新）
 TEMPORAL_LR = 3e-3
+# 時間集約器（lib_temporal.AGGREGATORS のキー）。"gru" が既定挙動（既知値再現）。
+# "attention"=過去Lステップへのsoftmax重み学習（重み[N,L]可視化可）、
+# "mean"/"last"=アブレーション用の単純基準。10は環境変数 TEMPORAL_AGG で上書き可。
+TEMPORAL_AGG = "gru"
 # (c) 公平比較: XGB-full(Qboth) と同じ立地系特徴を物件側ヘッドにも入れる。
 # Station_TE（駅名ターゲットエンコーディング, フォールド内fitでリーク防止）＋
 # Municipality / Zoning の one-hot を結合する。Falseで最小版（グラフ＋物件数値のみ）。

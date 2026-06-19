@@ -30,13 +30,17 @@ np.random.seed(C.RANDOM_STATE)
 
 FULL_EVAL = bool(os.environ.get("GNN_FULL_EVAL"))
 RICH = C.GNN_RICH_FEATURES
+# 時間集約器は config 既定（"gru"）。環境変数 TEMPORAL_AGG で attention/mean/last に切替可。
+AGG = os.environ.get("TEMPORAL_AGG", C.TEMPORAL_AGG)
 TEST_QUARTERS = C.EXPANDING_TEST_QUARTERS if FULL_EVAL else C.GNN_TEST_QUARTERS
 _stem = "gnn_temporal_rich" if RICH else "gnn_temporal"
 OUT_NAME = _stem + ("_q_full.csv" if FULL_EVAL else "_q.csv")
-GNN_LABEL = "GNN-temporal+feat" if RICH else "GNN-temporal(GRU)"
+_agg_tag = {"gru": "(GRU)", "attention": "(attn)", "mean": "(mean)", "last": "(last)"}
+GNN_LABEL = ("GNN-temporal+feat" if RICH else "GNN-temporal") + (
+    "" if RICH else _agg_tag.get(AGG, f"({AGG})"))
 L = C.TEMPORAL_SEQ_LEN
 
-print(f"=== 10. 時空間GNN・時間系列版 (GCN+GRU, L={L}, device={DEVICE}, "
+print(f"=== 10. 時空間GNN・時間系列版 (GCN+{AGG}, L={L}, device={DEVICE}, "
       f"rich={RICH}, {'全64四半期' if FULL_EVAL else '直近8四半期'}={len(TEST_QUARTERS)}fold) ===")
 df = pd.read_csv(C.DATA_DIR / "tokyo23_model_table_q.csv")
 df = df.dropna(subset=[C.TARGET, "Qidx"]).copy()
@@ -128,7 +132,7 @@ def train_eval_temporal(train_t, test_q, train_df, test_df):
     test_pack = prop_pack(test_df)
 
     model = SpatioTemporalGNN(n_node_feat=4, n_prop_feat=len(num_cols) + cat_dim,
-                              hidden=C.GNN_HIDDEN).to(DEVICE)
+                              hidden=C.GNN_HIDDEN, aggregator=AGG).to(DEVICE)
     opt = torch.optim.Adam(model.parameters(), lr=C.TEMPORAL_LR)
     loss_fn = torch.nn.MSELoss()
 
