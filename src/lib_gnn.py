@@ -116,11 +116,28 @@ class SpatioTemporalGNN(nn.Module):
         hidden→Module の factory・構築済みModule のいずれか。既定 "gru" は
         旧実装(GRU直書き)と同一計算・同一パラメータ初期化順で、既知値を再現する。
         ※GRU初期化のRNG順を旧実装(g1,g2,gru,head)に合わせるため、集約器は
-          __init__ 内の「g1,g2 の後・head の前」で build する。"""
-    def __init__(self, n_node_feat, n_prop_feat, hidden=32, aggregator="gru"):
+          __init__ 内の「g1,g2 の後・head の前」で build する。
+
+    spatial: 空間エンコーダの指定。"gcn"(既定)=2層GCNConvで近隣メッセージパッシング、
+        "none"=メッセージパッシングをしない per-node エンコーダ（g1/g2 を nn.Linear に
+        差し替え、encode() が edge_index を使わない）。"none" は in→hidden・層数・hidden
+        次元・head を "gcn" と完全に揃え、**近隣集約の有無だけ**を外す（2×2要因デザインの
+        graph トグル, 12_factorial_2x2.py が使う）。既定 "gcn" は計算・パラメータ初期化順
+        (g1,g2,aggregator,head) とも従来と一切変えない＝既知値を再現する。"""
+    def __init__(self, n_node_feat, n_prop_feat, hidden=32, aggregator="gru",
+                 spatial="gcn"):
         super().__init__()
-        self.g1 = GCNConv(n_node_feat, hidden)
-        self.g2 = GCNConv(hidden, hidden)
+        if spatial not in ("gcn", "none"):
+            raise ValueError(f"spatial は 'gcn'|'none' のいずれか: {spatial!r}")
+        self.spatial = spatial
+        if spatial == "gcn":
+            self.g1 = GCNConv(n_node_feat, hidden)
+            self.g2 = GCNConv(hidden, hidden)
+        else:
+            # 近隣集約なしの per-node エンコーダ（edge_index を使わない線形2層）。
+            # GCN版と in→hidden・層数・hidden 次元を揃え、メッセージパッシングのみ外す。
+            self.g1 = nn.Linear(n_node_feat, hidden)
+            self.g2 = nn.Linear(hidden, hidden)
         self.aggregator = build_aggregator(aggregator, hidden)
         self.head = nn.Sequential(
             nn.Linear(hidden + n_prop_feat, hidden), nn.ReLU(),
@@ -128,8 +145,12 @@ class SpatioTemporalGNN(nn.Module):
         )
 
     def encode(self, x, edge_index):
-        h = torch.relu(self.g1(x, edge_index))
-        return torch.relu(self.g2(h, edge_index))           # [N, hidden]
+        if self.spatial == "gcn":
+            h = torch.relu(self.g1(x, edge_index))
+            return torch.relu(self.g2(h, edge_index))       # [N, hidden]
+        # spatial=="none": edge_index は IF 互換のため受け取るが使わない（近隣集約なし）。
+        h = torch.relu(self.g1(x))
+        return torch.relu(self.g2(h))                       # [N, hidden]
 
     def temporal(self, h_seq, meta=None):
         # meta はステップ別メタ情報(gap[L]/obs[L,N])の任意 dict。既存集約器は無視する。
@@ -181,6 +202,62 @@ def assert_aggregator_only_diff(n_node_feat, n_prop_feat, hidden, aggregator):
             "head": shapes(base, "head."),
             "agg_gru": list(shapes(base, "aggregator.").items()),
             "agg_alt": list(shapes(alt, "aggregator.").items())}
+
+
+def assert_factorial_only_diff(n_node_feat, n_prop_feat, hidden):
+    """2×2要因デザイン（空間=近隣波及 graph × 時間=動態 temporal）のフェア比較の生命線。
+    4セルを構築し、(graph, temporal) の2トグル以外が完全一致であることを実行前に検証する:
+      - head(物件回帰MLP)のパラメータ形状が4セルで一致
+      - 最終空間表現の次元(=hidden, =head入力−物件特徴)が4セルで一致
+      - 空間エンコーダ g1/g2 の (in,out) 次元が4セルで一致（GCNConv でも nn.Linear でも）
+      - n_node_feat / n_prop_feat が4セルで一致
+    graph トグルは g1/g2 を GCNConv↔per-node nn.Linear に、temporal トグルは集約器を
+    GRU↔LastStep に切り替える。差分がこの2箇所だけであることをログ用 dict で返す。
+    （graph トグルでモジュール型が変わるため g1/g2 のパラメータ“名”は一致しない＝それが
+      比較したい差分の一つ。代わりに in→out 次元の一致で「同じ形・同じ層数」を担保する。）"""
+    cells = {
+        ("on", "on"):   dict(spatial="gcn",  aggregator="gru"),
+        ("on", "off"):  dict(spatial="gcn",  aggregator="last"),
+        ("off", "on"):  dict(spatial="none", aggregator="gru"),
+        ("off", "off"): dict(spatial="none", aggregator="last"),
+    }
+    models = {k: SpatioTemporalGNN(n_node_feat, n_prop_feat, hidden=hidden, **v)
+              for k, v in cells.items()}
+
+    def head_shapes(m):
+        return {n: tuple(p.shape) for n, p in m.named_parameters()
+                if n.startswith("head.")}
+
+    def io_dims(layer):                          # GCNConv / nn.Linear 両対応
+        if hasattr(layer, "in_features"):
+            return (layer.in_features, layer.out_features)
+        return (layer.in_channels, layer.out_channels)
+
+    ref_key = ("on", "on")
+    ref = models[ref_key]
+    ref_head = head_shapes(ref)
+    ref_g1, ref_g2 = io_dims(ref.g1), io_dims(ref.g2)
+    ref_head_in = ref.head[0].in_features
+    for k, m in models.items():
+        assert head_shapes(m) == ref_head, \
+            f"head が不一致（2トグル以外が違う）: {k} {head_shapes(m)} vs {ref_head}"
+        assert m.head[0].in_features == ref_head_in, \
+            f"最終空間表現の次元が不一致（2トグル以外が違う）: {k}"
+        assert io_dims(m.g1) == ref_g1 and io_dims(m.g2) == ref_g2, \
+            f"空間エンコーダ g1/g2 の(in,out)次元が不一致: {k} " \
+            f"{(io_dims(m.g1), io_dims(m.g2))} vs {(ref_g1, ref_g2)}"
+    assert ref_g1 == (n_node_feat, hidden) and ref_g2 == (hidden, hidden)
+    return {
+        "cells": {f"graph={g},temporal={t}": cells[(g, t)]
+                  for (g, t) in cells},
+        "shared": {"hidden": hidden, "head_in": ref_head_in,
+                   "n_node_feat": n_node_feat, "n_prop_feat": n_prop_feat,
+                   "g1_io": ref_g1, "g2_io": ref_g2, "head_shapes": ref_head,
+                   "layers": 2},
+        "toggles": {"graph": {"on": "GCNConv(近隣メッセージパッシング)",
+                              "off": "nn.Linear(per-node, 近隣集約なし)"},
+                    "temporal": {"on": "GRUAggregator", "off": "LastStepAggregator"}},
+    }
 
 
 class Standardizer:
