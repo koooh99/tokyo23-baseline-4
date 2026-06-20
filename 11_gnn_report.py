@@ -6,7 +6,6 @@
 # 入力は 09/10 が保存した outputs/*_full.csv。推移図はGNN per-fold(10のログ)＋
 # XGB-full per-fold(同条件で再計算)から作る。
 # ------------------------------------------------------------
-import re
 import sys
 import numpy as np
 import pandas as pd
@@ -99,62 +98,64 @@ print("  表: gnn_model_comparison.csv")
 print("\n[全体R² 比較（64四半期）]")
 print(tbl.to_string(index=False))
 
-# --- 図3: per-fold R² の時間推移（GNN-temporal+feat vs XGB-full） --
-def parse_log_r2(path):
-    if not (C.OUT_DIR / path).exists():
-        return {}
-    txt = (C.OUT_DIR / path).read_text(encoding="utf-8", errors="ignore")
-    out = {}
-    for m in re.finditer(r"Qidx=(\d+).*?R²=(-?\d+\.\d+)", txt):
-        out[int(m.group(1))] = float(m.group(2))
-    return out
-
-
-gnn_fold = parse_log_r2("10_rich_full_run.log")
-if gnn_fold:
-    try:
-        import xgboost as xgb
-        from sklearn.preprocessing import OneHotEncoder
-        from sklearn.compose import ColumnTransformer
-        from sklearn.pipeline import Pipeline
-        from lib_eval import expanding_window_pooled
-        from lib_features import StationTargetEncoder
-        df = pd.read_csv(C.DATA_DIR / "tokyo23_model_table_q.csv")
-        df = df.dropna(subset=[C.TARGET, "Qidx"]).copy(); df["Qidx"] = df["Qidx"].astype(int)
-        oh = ["Municipality"] + [c for c in C.CAT_FEATURES if c in df.columns]
-        num = C.BASE_FEATURES + C.DEFAULT_LAG_COLS + ["Station_TE"]
-        pre = ColumnTransformer([("oh", OneHotEncoder(handle_unknown="ignore"), oh),
-                                 ("num", "passthrough", num)])
-        mk = lambda: Pipeline([("pre", pre), ("reg", xgb.XGBRegressor(**C.XGB_PARAMS))])
-        print("\n推移図用に XGB-full per-fold を同条件で再計算中...")
-        rec, _ = expanding_window_pooled(
-            df, mk, oh + num, C.TARGET, C.EXPANDING_TEST_QUARTERS,
-            iqr_trim=C.IQR_TRIM, iqr_k=C.IQR_K, iqr_by_ward=C.IQR_BY_WARD,
-            fold_transform=StationTargetEncoder(C.TARGET, m=C.TE_SMOOTHING),
-            time_col="Qidx", progress=False)
-        xgb_fold = (rec[(rec.scope == "ALL")].set_index("test_year")["r2"].to_dict())
-
-        qs = sorted(set(gnn_fold) & set(xgb_fold))
-        fig, ax = plt.subplots(figsize=(11, 4.5))
-        xlab = [f"{q // 4}Q{q % 4 + 1}" for q in qs]
-        ax.plot(xlab, [gnn_fold[q] for q in qs], "-o", ms=3, color="crimson",
-                label="GNN+時系列+立地特徴")
-        ax.plot(xlab, [xgb_fold[q] for q in qs], "-s", ms=3, color="slategray",
-                label="XGB-full(Qboth)")
-        ax.set_ylabel("R² (各四半期テスト)")
-        ax.set_title("四半期ごとのR²推移：GNNは難局面(特に近年)で粘る")
-        step = max(1, len(qs) // 16)
-        ax.set_xticks(range(0, len(qs), step))
-        ax.set_xticklabels([xlab[i] for i in range(0, len(qs), step)], rotation=45, ha="right")
-        ax.legend(); ax.grid(True, ls="--", alpha=0.5)
-        plt.tight_layout()
-        fig.savefig(C.OUT_DIR / "fig_gnn_timeseries.png", dpi=150, bbox_inches="tight")
-        plt.close(fig)
-        win = sum(gnn_fold[q] > xgb_fold[q] for q in qs)
-        print(f"  図: fig_gnn_timeseries.png  (GNN勝ち {win}/{len(qs)} 四半期)")
-    except Exception as e:
-        print(f"  [skip] 推移図: {e}")
+# --- 図3: per-fold R² の時間推移（GNN vs XGB を「同一学習窓どうし」で比較） --
+# 入力は 10_gnn_temporal.py が窓ごとに保存する outputs/perfold_win{tag}.csv
+# （列: test_year, r2, model, window）。GNN(window=W) と XGB(window=W) を同一
+# フォールドで並べることで、旧 fig（GNN=3年窓 vs XGB=全期間窓）にあった「モデル差と
+# 学習窓差の交絡」を解消する。上段=重ね描き / 下段=差分曲線(GNN−XGB)。
+GNN_PF_LABEL = "GNN+時系列+立地特徴"   # 図の凡例表示名（CSVのmodel名とは別でよい）
+XGB_PF_NAME = "XGB-full(Qboth)"        # XGB行の識別名。GNN行は「XGB以外」で拾う
+pf_files = sorted(C.OUT_DIR.glob("perfold_win*.csv"))
+if not pf_files:
+    print("\n[推移図] perfold_win*.csv が無いため skip。"
+          "先に 10 を GNN_FULL_EVAL=1・各 GNN_TRAIN_WINDOW で実行してください。")
 else:
-    print("  [skip] 推移図: 10_rich_full_run.log が無い")
+    def _win_sort_key(p):                       # 12 < 24 < full の順に並べる
+        tag = p.stem.replace("perfold_win", "")
+        return (1, 0) if tag == "full" else (0, int(tag))
+    print("\n[推移図] 学習窓ごとに GNN vs XGB を同一フォールドで比較:")
+    for p in sorted(pf_files, key=_win_sort_key):
+        win_tag = p.stem.replace("perfold_win", "")
+        d = pd.read_csv(p)
+        gnn_fold = (d[d["model"] != XGB_PF_NAME].set_index("test_year")["r2"].to_dict())
+        xgb_fold = (d[d["model"] == XGB_PF_NAME].set_index("test_year")["r2"].to_dict())
+        qs = sorted(set(gnn_fold) & set(xgb_fold))
+        if not qs:
+            print(f"  - 窓={win_tag}: 共通フォールド無し、skip")
+            continue
+        xlab = [f"{q // 4}Q{q % 4 + 1}" for q in qs]
+        gv = np.array([gnn_fold[q] for q in qs])
+        xv = np.array([xgb_fold[q] for q in qs])
+        diff = gv - xv
+        wins = int((diff > 0).sum())
+        win_label = "全期間" if win_tag == "full" else f"直近{win_tag}四半期"
+
+        fig, (ax1, ax2) = plt.subplots(
+            2, 1, figsize=(11, 6.2), sharex=True,
+            gridspec_kw={"height_ratios": [2.1, 1]})
+        ax1.plot(xlab, gv, "-o", ms=3, color="crimson", label=GNN_PF_LABEL)
+        ax1.plot(xlab, xv, "-s", ms=3, color="slategray", label=XGB_PF_NAME)
+        ax1.set_ylabel("R² (各四半期テスト)")
+        # タイトルは断定せず、実際の勝敗カウントだけを中立に述べる。
+        ax1.set_title(
+            f"四半期ごとのR²：学習窓を揃えた比較（窓={win_label}）"
+            f"／GNN優位 {wins}/{len(qs)}四半期・平均差(GNN−XGB) {diff.mean():+.3f}")
+        ax1.legend(); ax1.grid(True, ls="--", alpha=0.5)
+        ax2.axhline(0, color="black", lw=0.8)
+        ax2.bar(range(len(qs)), diff, color=np.where(diff > 0, "crimson", "slategray"),
+                alpha=0.8)
+        ax2.set_ylabel("差分 GNN−XGB")
+        step = max(1, len(qs) // 16)
+        ax2.set_xticks(range(0, len(qs), step))
+        ax2.set_xticklabels([xlab[i] for i in range(0, len(qs), step)],
+                            rotation=45, ha="right")
+        ax2.grid(True, axis="y", ls="--", alpha=0.5)
+        plt.tight_layout()
+        out_png = C.OUT_DIR / f"fig_gnn_timeseries_win{win_tag}.png"
+        fig.savefig(out_png, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        print(f"  - 窓={win_tag}: {out_png.name}  "
+              f"GNN平均R²={gv.mean():.3f} / XGB平均R²={xv.mean():.3f} / "
+              f"GNN優位 {wins}/{len(qs)} 四半期 / 平均差 {diff.mean():+.3f}")
 
 print("\n完了")

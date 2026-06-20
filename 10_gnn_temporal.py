@@ -32,16 +32,39 @@ FULL_EVAL = bool(os.environ.get("GNN_FULL_EVAL"))
 RICH = C.GNN_RICH_FEATURES
 # 時間集約器は config 既定（"gru"）。環境変数 TEMPORAL_AGG で attention/mean/last に切替可。
 AGG = os.environ.get("TEMPORAL_AGG", C.TEMPORAL_AGG)
+
+
+def _parse_window(env_val, default):
+    """学習窓を環境変数 GNN_TRAIN_WINDOW から読む。未指定なら config 既定。
+    "none"/"all"/"full"/"0"/"" は全期間(None=Expanding)を意味する。"""
+    if env_val is None:
+        return default
+    v = env_val.strip().lower()
+    if v in ("none", "all", "full", "0", ""):
+        return None
+    return int(v)
+
+
+# 学習窓（直近何四半期で学習するか）。既定は config の 12。窓実験は環境変数で 12/24/None。
+WIN = _parse_window(os.environ.get("GNN_TRAIN_WINDOW"), C.GNN_TRAIN_WINDOW)
+WIN_TAG = "full" if WIN is None else str(WIN)
+# エポックは config 既定。窓実験を軽く回したいとき環境変数 TEMPORAL_EPOCHS で上書き可
+# （3窓で同一epoch＝窓以外の比較軸を増やさない。既定は既知値を再現する 30）。
+EPOCHS = int(os.environ.get("TEMPORAL_EPOCHS", C.TEMPORAL_EPOCHS))
 TEST_QUARTERS = C.EXPANDING_TEST_QUARTERS if FULL_EVAL else C.GNN_TEST_QUARTERS
 _stem = "gnn_temporal_rich" if RICH else "gnn_temporal"
-OUT_NAME = _stem + ("_q_full.csv" if FULL_EVAL else "_q.csv")
+# 既定窓(=config値)のときは従来ファイル名を維持（11の棒/サブグループ図が読む）。
+# 非既定窓のときだけ _win{tag} を付けて窓条件を区別する。
+WIN_SUFFIX = "" if WIN == C.GNN_TRAIN_WINDOW else f"_win{WIN_TAG}"
+OUT_NAME = _stem + ("_q_full" if FULL_EVAL else "_q") + WIN_SUFFIX + ".csv"
 _agg_tag = {"gru": "(GRU)", "attention": "(attn)", "mean": "(mean)", "last": "(last)"}
 GNN_LABEL = ("GNN-temporal+feat" if RICH else "GNN-temporal") + (
     "" if RICH else _agg_tag.get(AGG, f"({AGG})"))
 L = C.TEMPORAL_SEQ_LEN
 
-print(f"=== 10. 時空間GNN・時間系列版 (GCN+{AGG}, L={L}, device={DEVICE}, "
-      f"rich={RICH}, {'全64四半期' if FULL_EVAL else '直近8四半期'}={len(TEST_QUARTERS)}fold) ===")
+print(f"=== 10. 時空間GNN・時間系列版 (GCN+{AGG}, L={L}, 学習窓={WIN_TAG}, "
+      f"epochs={EPOCHS}, device={DEVICE}, rich={RICH}, "
+      f"{'全64四半期' if FULL_EVAL else '直近8四半期'}={len(TEST_QUARTERS)}fold) ===")
 df = pd.read_csv(C.DATA_DIR / "tokyo23_model_table_q.csv")
 df = df.dropna(subset=[C.TARGET, "Qidx"]).copy()
 df["Qidx"] = df["Qidx"].astype(int)
@@ -137,7 +160,7 @@ def train_eval_temporal(train_t, test_q, train_df, test_df):
     loss_fn = torch.nn.MSELoss()
 
     model.train()
-    for ep in range(C.TEMPORAL_EPOCHS):
+    for ep in range(EPOCHS):
         # 四半期ごとにstep（GRUの収束には1エポック1stepでは更新が少なすぎるため）。
         # 各stepで対象四半期の系列分だけGCNを通す（L枚）。
         for t in train_t:
@@ -161,7 +184,7 @@ def train_eval_temporal(train_t, test_q, train_df, test_df):
 
 records = []
 for q in TEST_QUARTERS:
-    win = C.GNN_TRAIN_WINDOW
+    win = WIN
     lo = q - win if win else qmin
     train_t = [t for t in all_q if lo <= t < q and (df["Qidx"] == t).any()
                and (t - L) >= qmin]
@@ -195,14 +218,27 @@ pre = ColumnTransformer([("oh", OneHotEncoder(handle_unknown="ignore"), ONEHOT),
                          ("num", "passthrough",
                           C.BASE_FEATURES + C.DEFAULT_LAG_COLS + ["Station_TE"])])
 mk = lambda: Pipeline([("pre", pre), ("reg", xgb.XGBRegressor(**C.XGB_PARAMS))])
-print("\nXGB-full(Qboth) を同一フォールドで評価中...")
+print(f"\nXGB-full(Qboth) を同一フォールド・同一学習窓(={WIN_TAG})で評価中...")
 rec_x, _ = expanding_window_pooled(
     df, mk, ONEHOT + C.BASE_FEATURES + C.DEFAULT_LAG_COLS + ["Station_TE"],
     C.TARGET, TEST_QUARTERS, iqr_trim=C.IQR_TRIM, iqr_k=C.IQR_K,
     iqr_by_ward=C.IQR_BY_WARD, subgroups=subgroups,
     fold_transform=StationTargetEncoder(C.TARGET, m=C.TE_SMOOTHING),
-    time_col="Qidx", progress=False)
+    time_col="Qidx", progress=False, train_window=WIN)
 xgb_sum = summarize(rec_x); xgb_sum.insert(0, "model", "XGB-full(Qboth)")
+
+# --- per-fold R²（GNN と XGB を同一窓・同一フォールドで）を保存 -----
+# 11 の推移図が「同一窓どうし」で重ね描き＋差分曲線を引くための入力。
+gnn_pf = pd.DataFrame([{"test_year": r["test_year"], "r2": r["r2"]}
+                       for r in records if r["scope"] == "ALL"])
+gnn_pf = gnn_pf.assign(model=GNN_LABEL, window=WIN_TAG)
+xgb_pf = (rec_x[rec_x["scope"] == "ALL"][["test_year", "r2"]]
+          .assign(model="XGB-full(Qboth)", window=WIN_TAG))
+perfold = pd.concat([gnn_pf, xgb_pf], ignore_index=True)
+perfold_path = C.OUT_DIR / f"perfold_win{WIN_TAG}.csv"
+perfold.to_csv(perfold_path, index=False, encoding="utf-8-sig")
+print(f"per-fold保存: {perfold_path.name} "
+      f"(GNN {len(gnn_pf)}fold / XGB {len(xgb_pf)}fold, 窓={WIN_TAG})")
 
 summary = pd.concat([temp_sum, xgb_sum], ignore_index=True)
 out = C.OUT_DIR / OUT_NAME
