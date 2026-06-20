@@ -10,9 +10,31 @@
 import numpy as np
 import torch
 import torch.nn as nn
-from torch_geometric.nn import GCNConv
+from torch_geometric.nn import GCNConv, GATConv, GATv2Conv
 
 from lib_temporal import build_aggregator
+
+
+# 名前 → conv クラス。run_compare / 09 が文字列で空間conv層を選べるようにする
+# （lib_temporal.AGGREGATORS の空間版）。
+SPATIAL_CONVS = {"gcn": GCNConv, "gat": GATConv, "gatv2": GATv2Conv}
+
+
+def build_spatial_conv(spec, in_dim, out_dim, heads=1, concat=True):
+    """空間conv層を1つ構築する。spec は "gcn"|"gat"|"gatv2"。
+      - "gcn": GCNConv(in,out)。対称正規化による近隣の等重み平均（heads/concatは無視）。
+        既存挙動を一切変えないため、GCNConv(in_dim,out_dim) を素直に返す
+        （パラメータ初期化のRNG順も従来と同一＝既知値を再現する）。
+      - "gat"/"gatv2": 同じ edge_index 上で辺の注意重みのみを学習する。
+        heads/concat で出力次元を制御（呼び出し側で hidden に揃える）。
+        self-loop は PyG 既定(add_self_loops=True)＝GCNConvと同じく自己ループを含めて
+        近隣分布を正規化する（GCN版との整合）。"""
+    if spec == "gcn":
+        return GCNConv(in_dim, out_dim)
+    cls = SPATIAL_CONVS.get(spec)
+    if cls is None:
+        raise ValueError(f"未知の空間conv: {spec!r}（候補: {list(SPATIAL_CONVS)}）")
+    return cls(in_dim, out_dim, heads=heads, concat=concat)
 
 
 def build_graph(node_keys, neighbors):
@@ -34,18 +56,48 @@ def build_graph(node_keys, neighbors):
 
 
 class SpatioGCN(nn.Module):
-    """2層GCNで町表現を作り、物件特徴と結合して平米単価(標準化後)を回帰する。"""
-    def __init__(self, n_node_feat, n_prop_feat, hidden=32):
+    """2層の空間convで町表現を作り、物件特徴と結合して平米単価(標準化後)を回帰する。
+
+    conv: 空間conv層の指定（"gcn"|"gat"|"gatv2"）。**変えるのはconv層だけ**で、
+        hidden次元・層数・head(物件回帰MLP)・出力次元は全構成で完全一致させる
+        （フェア比較の生命線）。既定 "gcn" は従来実装と同一計算・同一パラメータ初期化順
+        （g1→g2→head）で既知値を再現する。
+      - "gcn": 2層とも GCNConv。最終出力 hidden。
+      - "gat"/"gatv2": 1層目 heads=GAT_HEADS concat=True → hidden*heads、
+        2層目 heads=1 concat=False → hidden。最終出力は GCN版と同じ hidden。
+        同じ edge_index 上で辺の注意重みのみを学習する。
+
+    forward(..., return_attention=True) のとき、1層目(多ヘッド)の辺注意を
+    self.last_attention [E,heads] / self.last_att_edge_index [2,E] に保持する
+    （§6dの時間attentionの空間版＝学習近隣重みの解釈分析用）。"""
+    def __init__(self, n_node_feat, n_prop_feat, hidden=32, conv="gcn", heads=4):
         super().__init__()
-        self.g1 = GCNConv(n_node_feat, hidden)
-        self.g2 = GCNConv(hidden, hidden)
+        self.conv_kind = conv
+        if conv == "gcn":
+            self.g1 = build_spatial_conv("gcn", n_node_feat, hidden)
+            self.g2 = build_spatial_conv("gcn", hidden, hidden)
+        else:
+            self.g1 = build_spatial_conv(conv, n_node_feat, hidden,
+                                         heads=heads, concat=True)   # → hidden*heads
+            self.g2 = build_spatial_conv(conv, hidden * heads, hidden,
+                                         heads=1, concat=False)      # → hidden
         self.head = nn.Sequential(
             nn.Linear(hidden + n_prop_feat, hidden), nn.ReLU(),
             nn.Linear(hidden, 1),
         )
+        self.last_attention = None          # [E,heads]（1層目, GAT系のみ）
+        self.last_att_edge_index = None     # [2,E]（self-loop付与後の辺, GAT系のみ）
 
-    def forward(self, x, edge_index, prop_node_idx, prop_feat):
-        h = torch.relu(self.g1(x, edge_index))
+    def forward(self, x, edge_index, prop_node_idx, prop_feat, return_attention=False):
+        if self.conv_kind == "gcn":
+            h = torch.relu(self.g1(x, edge_index))
+        elif return_attention:
+            h, (ei, alpha) = self.g1(x, edge_index, return_attention_weights=True)
+            self.last_attention = alpha.detach()
+            self.last_att_edge_index = ei.detach()
+            h = torch.relu(h)
+        else:
+            h = torch.relu(self.g1(x, edge_index))
         h = torch.relu(self.g2(h, edge_index))
         hp = h[prop_node_idx]                       # 各物件の所在町の表現
         z = torch.cat([hp, prop_feat], dim=1)
@@ -79,12 +131,56 @@ class SpatioTemporalGNN(nn.Module):
         h = torch.relu(self.g1(x, edge_index))
         return torch.relu(self.g2(h, edge_index))           # [N, hidden]
 
-    def temporal(self, h_seq):
-        return self.aggregator(h_seq)                        # [L,N,hidden] → [N,hidden]
+    def temporal(self, h_seq, meta=None):
+        # meta はステップ別メタ情報(gap[L]/obs[L,N])の任意 dict。既存集約器は無視する。
+        return self.aggregator(h_seq, meta)                  # [L,N,hidden] → [N,hidden]
 
     def predict(self, h, prop_node_idx, prop_feat):
         z = torch.cat([h[prop_node_idx], prop_feat], dim=1)
         return self.head(z).squeeze(-1)
+
+
+def assert_conv_only_diff(n_node_feat, n_prop_feat, hidden, heads, conv="gatv2"):
+    """フェア比較の生命線：GCN版とconv版が「conv層(g1,g2)以外は完全一致」であることを
+    検証し、ログ用dictを返す。head(物件回帰MLP)のパラメータ形状と最終空間表現の次元
+    (=hidden)が一致することをassertする。差分が conv 層だけであることを明示するのに使う。"""
+    gcn = SpatioGCN(n_node_feat, n_prop_feat, hidden=hidden, conv="gcn")
+    alt = SpatioGCN(n_node_feat, n_prop_feat, hidden=hidden, conv=conv, heads=heads)
+
+    def head_shapes(m):
+        return {n: tuple(p.shape) for n, p in m.named_parameters()
+                if n.startswith("head.")}
+    hg, ha = head_shapes(gcn), head_shapes(alt)
+    assert hg == ha, f"head が不一致（conv層以外が違う）: {hg} vs {ha}"
+    assert gcn.head[0].in_features == alt.head[0].in_features, \
+        "最終空間表現の次元が不一致（conv層以外が違う）"
+    return {"conv": conv, "heads": heads, "hidden_out": hidden,
+            "head_in": gcn.head[0].in_features, "head_shapes": hg,
+            "n_node_feat": n_node_feat, "n_prop_feat": n_prop_feat}
+
+
+def assert_aggregator_only_diff(n_node_feat, n_prop_feat, hidden, aggregator):
+    """フェア比較の生命線（時間集約器版）：GRU 実行と aggregator 実行が
+    「時間集約器(aggregator)以外は完全一致」であることを検証し、ログ用 dict を返す。
+    空間conv g1/g2（GCN）と物件回帰 head のパラメータ形状が GRU 版と一致することを
+    assert する。差分が aggregator サブモジュールだけであることを明示するのに使う。
+    （集約器ごとにパラメータ数は当然違う＝それが比較したい唯一の差分。g1/g2/head が
+    一致していれば「変えたのは集約器のみ」が担保される。）"""
+    base = SpatioTemporalGNN(n_node_feat, n_prop_feat, hidden=hidden, aggregator="gru")
+    alt = SpatioTemporalGNN(n_node_feat, n_prop_feat, hidden=hidden, aggregator=aggregator)
+
+    def shapes(m, prefix):
+        return {n: tuple(p.shape) for n, p in m.named_parameters()
+                if n.startswith(prefix)}
+    for pre in ("g1.", "g2.", "head."):
+        sb, sa = shapes(base, pre), shapes(alt, pre)
+        assert sb == sa, f"{pre} が不一致（集約器以外が違う）: {sb} vs {sa}"
+    return {"aggregator": aggregator, "hidden": hidden,
+            "n_node_feat": n_node_feat, "n_prop_feat": n_prop_feat,
+            "g1": shapes(base, "g1."), "g2": shapes(base, "g2."),
+            "head": shapes(base, "head."),
+            "agg_gru": list(shapes(base, "aggregator.").items()),
+            "agg_alt": list(shapes(alt, "aggregator.").items())}
 
 
 class Standardizer:
@@ -104,12 +200,15 @@ class Standardizer:
 
 
 def train_eval_fold(model, snapshots, edge_index, train_q, test_q,
-                    epochs=40, lr=1e-3, device="cpu", verbose=False):
+                    epochs=40, lr=1e-3, device="cpu", verbose=False,
+                    return_attention=False):
     """1フォールド学習＋評価。
     snapshots[q] = dict(x=[N,Fn] node特徴(標準化済), node_idx=[n] 物件→ノード,
                         prop=[n,Fp] 物件特徴(標準化済), y=[n] 目的(標準化済), y_raw=[n] 生値)。
     train_q: 訓練に使う四半期リスト / test_q: 評価する単一四半期。
-    返り値: (pred_raw[np], y_raw[np], muni[np])  ※muniは呼び出し側で持たせる。"""
+    return_attention=True のとき、評価forwardで GAT系1層目の辺注意を
+    model.last_attention / model.last_att_edge_index に格納する（GCN版では無視される）。
+    返り値: pred[np]（標準化後の予測）。"""
     model = model.to(device)
     opt = torch.optim.Adam(model.parameters(), lr=lr)
     ei = edge_index.to(device)
@@ -142,5 +241,6 @@ def train_eval_fold(model, snapshots, edge_index, train_q, test_q,
 
     model.eval()
     with torch.no_grad():
-        pred = model(te["x"], ei, te["node_idx"], te["prop"]).cpu().numpy()
+        pred = model(te["x"], ei, te["node_idx"], te["prop"],
+                     return_attention=return_attention).cpu().numpy()
     return pred

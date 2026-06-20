@@ -141,6 +141,15 @@ GNN_EPOCHS = 40
 GNN_LR = 1e-3
 GNN_DEVICE = "cpu"            # MPSはハングし得るためCPU既定（環境変数 GNN_DEVICE で上書き）
 
+# 空間conv層のセレクタ（TEMPORAL_AGG と対になる空間版, lib_gnn.SPATIAL_CONVS のキー）。
+# "gcn"=対称正規化の等重み平均（既定・既存挙動を一切変えない）、
+# "gat"=GATConv(static attention)、"gatv2"=GATv2Conv(dynamic attention, 推奨)。
+# 09/run_compare は環境変数 SPATIAL_CONV で上書き可。GATは同じedge_index上で辺重みのみ学習する。
+SPATIAL_CONV = "gcn"
+# GAT系1層目のヘッド数。1層目 heads=GAT_HEADS concat=True → hidden*heads、
+# 2層目 heads=1 concat=False → hidden（出力次元をGCN版の hidden に一致させる）。
+GAT_HEADS = 4
+
 # --- 時空間GNN・時間系列版（10, GCN+GRU） --------------------------
 # 各町の「直近LQの観測平米単価系列」を GCN→GRU で集約し、直近性を学習させる。
 # ノード特徴は観測平米単価(前方補完)＋観測フラグ＋重心。系列長は直近性/季節性を
@@ -151,6 +160,11 @@ TEMPORAL_LR = 3e-3
 # 時間集約器（lib_temporal.AGGREGATORS のキー）。"gru" が既定挙動（既知値再現）。
 # "attention"=過去Lステップへのsoftmax重み学習（重み[N,L]可視化可）、
 # "mean"/"last"=アブレーション用の単純基準。10は環境変数 TEMPORAL_AGG で上書き可。
+# --- time-aware 注意（①, 15が使う。§6dの一様化が前方補完の artifact か内在かを切り分ける）---
+# "time_attn_gap"=学習した時間ギャップ埋め込みを key に加える加法注意（全Lに注意・
+#   直近を区別する自由度を付与）。"time_attn_obs"=上に加え前方補完(非観測)ステップを
+#   強く減衰し実観測中心に注意を張る（不等間隔系列扱い）。どちらも last_weights[N,L] を
+#   §6d と同形式で出す。既定 TEMPORAL_AGG は変更しない（"gru" のまま）。
 TEMPORAL_AGG = "gru"
 # (c) 公平比較: XGB-full(Qboth) と同じ立地系特徴を物件側ヘッドにも入れる。
 # Station_TE（駅名ターゲットエンコーディング, フォールド内fitでリーク防止）＋

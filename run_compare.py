@@ -19,6 +19,7 @@ import pandas as pd
 sys.path.append("src")
 import config as C
 import lib_compare as LC
+from lib_gnn import assert_conv_only_diff
 
 DEVICE = os.environ.get("GNN_DEVICE", C.GNN_DEVICE)
 FULL_EVAL = bool(os.environ.get("GNN_FULL_EVAL"))
@@ -33,6 +34,9 @@ MODELS = [
     ("XGB-full",             lambda df, g: LC.run_xgb_full(df, TEST_QUARTERS, SUB)),
     ("GNN-min",              lambda df, g: LC.run_static_gnn(
         df, *g, TEST_QUARTERS, SUB, device=DEVICE)),
+    ("GNN-min-GAT",          lambda df, g: LC.run_static_gnn(
+        df, *g, TEST_QUARTERS, SUB, device=DEVICE, conv="gatv2",
+        tag="GNN-min-GAT")),
     ("GNN-temporal[GRU]",    lambda df, g: LC.run_temporal_gnn(
         df, *g, TEST_QUARTERS, SUB, device=DEVICE, aggregator="gru", rich=True,
         tag="GNN-temporal[GRU]")),
@@ -55,6 +59,17 @@ print("グラフ（町丁目queen隣接）を構築中...")
 node_index, edge_index, N = LC.build_town_graph(df)
 graph = (node_index, edge_index, N)
 print(f"  ノード(町)数: {N}  辺数(有向): {edge_index.shape[1]}")
+
+# フェア比較の生命線：GNN-min(GCN) と GNN-min-GAT(GATv2) は conv 層(g1,g2)以外
+# 完全一致であることを実行前に検証・明示する（head/最終次元/共有ハイパラ）。
+_info = assert_conv_only_diff(n_node_feat=4, n_prop_feat=len(C.GNN_PROP_FEATURES),
+                              hidden=C.GNN_HIDDEN, heads=C.GAT_HEADS, conv="gatv2")
+print(f"[conv層のみ差分の確認] GCN版とGATv2版で head/最終空間表現次元が一致: "
+      f"hidden={_info['hidden_out']}, head_in={_info['head_in']}"
+      f"(=hidden+物件特徴{_info['n_prop_feat']}), head形状={_info['head_shapes']}")
+print(f"  共有ハイパラ: 層数=2, hidden={C.GNN_HIDDEN}, optimizer=Adam, "
+      f"lr={C.GNN_LR}, epochs={C.GNN_EPOCHS}, seed={C.RANDOM_STATE}, "
+      f"GAT_HEADS={C.GAT_HEADS}（変えるのは conv 層のみ）")
 
 summaries = []
 for name, run in MODELS:

@@ -27,6 +27,8 @@ from lib_spatial import load_town_polygons, build_neighbors
 from lib_gnn import build_graph, SpatioGCN, Standardizer, train_eval_fold
 
 DEVICE = os.environ.get("GNN_DEVICE", C.GNN_DEVICE)
+# 空間conv層のセレクタ（既定 gcn＝既存挙動）。環境変数 SPATIAL_CONV で gat/gatv2 に切替。
+CONV = os.environ.get("SPATIAL_CONV", C.SPATIAL_CONV)
 torch.manual_seed(C.RANDOM_STATE)
 np.random.seed(C.RANDOM_STATE)
 
@@ -36,7 +38,7 @@ FULL_EVAL = bool(os.environ.get("GNN_FULL_EVAL"))
 TEST_QUARTERS = C.EXPANDING_TEST_QUARTERS if FULL_EVAL else C.GNN_TEST_QUARTERS
 OUT_NAME = "gnn_vs_xgb_q_full.csv" if FULL_EVAL else "gnn_vs_xgb_q.csv"
 
-print(f"=== 9. 時空間GNN (最小v0, device={DEVICE}, "
+print(f"=== 9. 時空間GNN (最小v0, conv={CONV}, device={DEVICE}, "
       f"{'全64四半期' if FULL_EVAL else '直近8四半期'}={len(TEST_QUARTERS)}fold) ===")
 df = pd.read_csv(C.DATA_DIR / "tokyo23_model_table_q.csv")
 df = df.dropna(subset=[C.TARGET, "Qidx"]).copy()
@@ -111,7 +113,8 @@ for q in TEST_QUARTERS:
     snapshots = {t: make_snap(train_df[train_df["Qidx"] == t], t) for t in train_q}
     snapshots[q] = make_snap(test_df, q)
 
-    model = SpatioGCN(n_node_feat=4, n_prop_feat=len(PROP), hidden=C.GNN_HIDDEN)
+    model = SpatioGCN(n_node_feat=4, n_prop_feat=len(PROP), hidden=C.GNN_HIDDEN,
+                      conv=CONV, heads=C.GAT_HEADS)
     pred_std = train_eval_fold(model, snapshots, edge_index, train_q, q,
                                epochs=C.GNN_EPOCHS, lr=C.GNN_LR, device=DEVICE)
     pred = pred_std * y_std + y_mean

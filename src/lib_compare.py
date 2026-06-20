@@ -94,10 +94,17 @@ def run_xgb_propT(df, test_quarters, subgroups, tag="XGB-propT(自町T-lagのみ
                       subgroups, use_te=False)
 
 
-# --- 静的GCN（09 の学習ループを抽出） -----------------------------
+# --- 静的GCN/GAT（09 の学習ループを抽出。conv層を差し替え可能に） ----
 def run_static_gnn(df, node_index, edge_index, N, test_quarters, subgroups,
-                   device="cpu", tag="GNN(min v0)"):
-    """各四半期スナップショットに2層GCN → 物件特徴と結合して回帰（09と同一）。"""
+                   device="cpu", conv="gcn", heads=None, tag="GNN(min v0)",
+                   weight_sink=None):
+    """各四半期スナップショットに2層の空間conv → 物件特徴と結合して回帰（09と同一）。
+    conv: "gcn"(既定・既存挙動)|"gat"|"gatv2"。変えるのはconv層だけ（hidden/層数/head/
+        optimizer/lr/epoch/seed は全conv共通）。
+    weight_sink: GAT系のとき各テスト四半期の評価後に
+        weight_sink(q, test_df, att_edge_index[2,E], alpha[E,heads]) を呼ぶ
+        （学習近隣重みの解釈分析用。既定None＝挙動・数値とも不変）。"""
+    heads = heads if heads is not None else C.GAT_HEADS
     torch.manual_seed(C.RANDOM_STATE); np.random.seed(C.RANDOM_STATE)
     edge_index = edge_index.to(device)
     LAGF = ["Lag_q1_AvgPrice", "Lag_q4_AvgPrice"]
@@ -138,10 +145,16 @@ def run_static_gnn(df, node_index, edge_index, N, test_quarters, subgroups,
                         y=((rows[C.TARGET].to_numpy() - y_mean) / y_std))
         snapshots = {t: make_snap(train_df[train_df["Qidx"] == t], t) for t in train_q}
         snapshots[q] = make_snap(test_df, q)
-        model = SpatioGCN(n_node_feat=4, n_prop_feat=len(PROP), hidden=C.GNN_HIDDEN)
+        model = SpatioGCN(n_node_feat=4, n_prop_feat=len(PROP), hidden=C.GNN_HIDDEN,
+                          conv=conv, heads=heads)
+        want_att = weight_sink is not None and conv != "gcn"
         pred = train_eval_fold(model, snapshots, edge_index, train_q, q,
-                               epochs=C.GNN_EPOCHS, lr=C.GNN_LR, device=device)
+                               epochs=C.GNN_EPOCHS, lr=C.GNN_LR, device=device,
+                               return_attention=want_att)
         pred = pred * y_std + y_mean
+        if want_att and model.last_attention is not None:
+            weight_sink(q, test_df, model.last_att_edge_index.cpu().numpy(),
+                        model.last_attention.cpu().numpy())
         _record(records, test_df.assign(pred=pred), q, subgroups)
     s = summarize(pd.DataFrame(records)); s.insert(0, "model", tag)
     return s
@@ -202,6 +215,17 @@ def run_temporal_gnn(df, node_index, edge_index, N, test_quarters, subgroups,
         cat_dim = sum(len(c) for c in ohe.categories_) if ohe is not None else 0
         Xstd = {t: torch.tensor(node_std.transform(raw_node_feat(t)),
                                 dtype=torch.float32, device=device) for t in need_ts}
+        # ステップ別メタ情報（time-aware 集約器用。既存集約器は無視するので数値不変）。
+        # obs は各ステップ四半期の観測フラグ[N]（1=実観測 / 0=前方補完で埋めた町）。
+        OBS_t = {t: torch.tensor(OBS[qpos[t]], dtype=torch.float32, device=device)
+                 for t in need_ts}
+
+        def meta_for(tq):
+            steps = seq_steps(tq)                                   # [tq-L,…,tq-1]（過去のみ）
+            gap = torch.tensor([tq - s for s in steps],            # [L] = [L,…,1]
+                               dtype=torch.long, device=device)
+            obs = torch.stack([OBS_t[s] for s in steps], dim=0)    # [L,N]
+            return {"gap": gap, "obs": obs}
 
         def prop_pack(rows):
             num = prop_std.transform(rows[num_cols].to_numpy(dtype=float))
@@ -225,7 +249,7 @@ def run_temporal_gnn(df, node_index, edge_index, N, test_quarters, subgroups,
                 opt.zero_grad()
                 H = {s: model.encode(Xstd[s], edge_index) for s in seq_steps(t)}
                 seq = torch.stack([H[s] for s in seq_steps(t)], dim=0)
-                h = model.temporal(seq)
+                h = model.temporal(seq, meta_for(t))
                 idx, pf, y = train_packs[t]
                 loss = loss_fn(model.predict(h, idx, pf), y)
                 loss.backward(); opt.step()
@@ -233,7 +257,7 @@ def run_temporal_gnn(df, node_index, edge_index, N, test_quarters, subgroups,
         with torch.no_grad():
             H = {t: model.encode(Xstd[t], edge_index) for t in seq_steps(test_q)}
             seq = torch.stack([H[s] for s in seq_steps(test_q)], dim=0)
-            h = model.temporal(seq)
+            h = model.temporal(seq, meta_for(test_q))
             idx, pf, _ = test_pack
             pred = model.predict(h, idx, pf).cpu().numpy() * y_std + y_mean
         w = None
