@@ -53,6 +53,7 @@ import geopandas as gpd
 import matplotlib.pyplot as plt
 from matplotlib.collections import LineCollection
 from matplotlib.lines import Line2D
+from matplotlib.patches import Patch
 from scipy.stats import mannwhitneyu
 
 sys.path.append("src")
@@ -201,17 +202,14 @@ gT.plot(column="l1_dev", cmap="OrRd", vmin=0.0, vmax=vmax, ax=ax,
         linewidth=0.15, edgecolor="white",
         legend=True, legend_kwds={"shrink": 0.55,
                                   "label": "近隣重みの非一様性 L1 逸脱 Σ|w−1/deg|"},
-        missing_kwds={"color": BASE, "edgecolor": "white", "linewidth": 0.1,
-                      "label": "欠損（取引なし/結合不可）"})
-c5_boundary.plot(ax=ax, color=ACCENT, linewidth=2.2, zorder=5)
-# 「ここを見て」: 都心5区へ矢印 + 囲い注記
-cx = towns_poly[towns_poly["Municipality"].isin(C.CENTRAL_5)].total_bounds
-ax.annotate("都心5区＝局所的な空間異質性\n（重みが非一様に偏る帯）",
-            xy=((cx[0] + cx[2]) / 2, (cx[1] + cx[3]) / 2),
-            xytext=(cx[0] - 9000, cx[3] + 6000), fontsize=11, color=ACCENT,
-            fontweight="bold",
-            arrowprops=dict(arrowstyle="->", color=ACCENT, lw=2.0),
-            bbox=dict(boxstyle="round", fc="white", ec=ACCENT, alpha=0.9))
+        missing_kwds={"color": BASE, "edgecolor": "white", "linewidth": 0.1})
+# 都心5区の区界（OrRdと被らない濃紺で。凡例で何の線かだけ示す）
+C5LINE = "#08306b"
+c5_boundary.plot(ax=ax, color=C5LINE, linewidth=2.2, zorder=5)
+ax.legend(handles=[Line2D([0], [0], color=C5LINE, lw=2.2, label="都心5区 区界"),
+                   Patch(facecolor=BASE, edgecolor="white",
+                         label="欠損（取引なし/結合不可）")],
+          loc="upper left", framealpha=0.9, fontsize=10)
 ax.set_title("地図①　GAT近隣重みの非一様性（全23区・町丁目）\n"
              "濃=非一様（特定近隣に集中）／淡=一様（≒GCNの等重み平均）",
              fontsize=13)
