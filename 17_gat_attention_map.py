@@ -50,6 +50,7 @@ from collections import defaultdict
 import numpy as np
 import pandas as pd
 import geopandas as gpd
+from shapely.geometry import Polygon, MultiPolygon
 import matplotlib.pyplot as plt
 from matplotlib.collections import LineCollection
 from matplotlib.lines import Line2D
@@ -187,9 +188,19 @@ gT = towns_poly.merge(T, left_on=["Municipality", "DistrictName"],
 n_join = gT["l1_dev"].notna().sum()
 print(f"\n  ポリゴン結合: {n_join}/{len(towns_poly)} 町に l1_dev を付与 "
       f"(残りは取引なし/町名NaN → 欠損グレー表示)")
-# 都心5区を1つに融合した「外郭線」のみ（区内・区間の内部境界は描かない）
-c5_boundary = (towns_poly[towns_poly["Municipality"].isin(C.CENTRAL_5)]
-               .dissolve().boundary)
+# 都心5区を1つに融合した「外郭線」のみ。dissolve だけだと町ポリゴン間の隙間
+# （スリバーや公園/水面など丁目に属さない領域）が内部の穴として残り、その輪郭が
+# 内側に描かれてしまう。穴(interior ring)を捨て外側リングだけにする
+# （月島・勝どき等の埋立地は隅田川で分離した別ポリゴン＝正当な外郭なので残す）。
+def _exterior_only(geom):
+    if geom.geom_type == "Polygon":
+        return Polygon(geom.exterior)
+    return MultiPolygon([Polygon(g.exterior) for g in geom.geoms])
+
+_c5_union = (towns_poly[towns_poly["Municipality"].isin(C.CENTRAL_5)]
+             .dissolve().geometry.iloc[0].buffer(0))   # buffer(0)で位相を整える
+c5_boundary = gpd.GeoSeries([_exterior_only(_c5_union).boundary],
+                            crs=towns_poly.crs)
 
 NOTE = ("注: 学習済みGATの近隣集約重みの非一様性（attention is not explanation）。"
         "価格の“価値”でなく“構造の在り処”の診断。\n"
