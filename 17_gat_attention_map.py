@@ -72,6 +72,8 @@ except ImportError:
 BASE = "#d9d9d9"        # ベース: 欠損・地味な辺（淡いグレー）
 SUB = "#2c7fb7"         # サブ : その他18区
 ACCENT = "#e6550d"      # アクセント: 都心5区/突出を強調
+WATER = "#dce9f2"       # 陸地外（海・河川・23区外）＝非陸地を表す背景
+MISSING = "#b0b0b0"     # 欠損の町（陸地はあるが値なし）。水色と判別できる濃さ
 
 DEVICE = os.environ.get("GNN_DEVICE", C.GNN_DEVICE)
 FULL_EVAL = bool(os.environ.get("GNN_FULL_EVAL"))
@@ -208,18 +210,23 @@ NOTE = ("注: 学習済みGATの近隣集約重みの非一様性（attention is
 
 # ============================ 地図①: 全域 choropleth =========================
 fig, ax = plt.subplots(figsize=(9.5, 9.5))
+# 背景=水色（=陸地が描かれない部分＝海・河川・23区外）。陸地は下で必ず塗るので、
+# 残る背景は物理的に非陸地の領域だけになる。欠損の町(陸地あり・値なし)はグレーで別色。
+ax.set_facecolor(WATER)
 vmax = float(np.nanpercentile(gT["l1_dev"], 97))   # 外れ値で潰れないよう97%点でクリップ
 gT.plot(column="l1_dev", cmap="OrRd", vmin=0.0, vmax=vmax, ax=ax,
         linewidth=0.15, edgecolor="white",
         legend=True, legend_kwds={"shrink": 0.55,
                                   "label": "近隣重みの非一様性 L1 逸脱 Σ|w−1/deg|"},
-        missing_kwds={"color": BASE, "edgecolor": "white", "linewidth": 0.1})
+        missing_kwds={"color": MISSING, "edgecolor": "white", "linewidth": 0.1})
 # 都心5区の区界（OrRdと被らない濃紺で。凡例で何の線かだけ示す）
 C5LINE = "#08306b"
 c5_boundary.plot(ax=ax, color=C5LINE, linewidth=2.2, zorder=5)
 ax.legend(handles=[Line2D([0], [0], color=C5LINE, lw=2.2, label="都心5区 外郭"),
-                   Patch(facecolor=BASE, edgecolor="white",
-                         label="欠損（取引なし/結合不可）")],
+                   Patch(facecolor=MISSING, edgecolor="white",
+                         label="欠損（陸地あり・取引なし/結合不可）"),
+                   Patch(facecolor=WATER, edgecolor="#9fb8cc",
+                         label="陸地外（海・河川・23区外）")],
           loc="upper left", framealpha=0.9, fontsize=10)
 ax.set_title("地図①　GAT近隣重みの非一様性（全23区・町丁目）\n"
              "濃=非一様（特定近隣に集中）／淡=一様（≒GCNの等重み平均）",
