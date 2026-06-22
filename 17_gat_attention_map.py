@@ -187,9 +187,9 @@ gT = towns_poly.merge(T, left_on=["Municipality", "DistrictName"],
 n_join = gT["l1_dev"].notna().sum()
 print(f"\n  ポリゴン結合: {n_join}/{len(towns_poly)} 町に l1_dev を付与 "
       f"(残りは取引なし/町名NaN → 欠損グレー表示)")
-# 都心5区の区界（太線オーバーレイ用）
+# 都心5区を1つに融合した「外郭線」のみ（区内・区間の内部境界は描かない）
 c5_boundary = (towns_poly[towns_poly["Municipality"].isin(C.CENTRAL_5)]
-               .dissolve(by="Municipality").boundary)
+               .dissolve().boundary)
 
 NOTE = ("注: 学習済みGATの近隣集約重みの非一様性（attention is not explanation）。"
         "価格の“価値”でなく“構造の在り処”の診断。\n"
@@ -206,7 +206,7 @@ gT.plot(column="l1_dev", cmap="OrRd", vmin=0.0, vmax=vmax, ax=ax,
 # 都心5区の区界（OrRdと被らない濃紺で。凡例で何の線かだけ示す）
 C5LINE = "#08306b"
 c5_boundary.plot(ax=ax, color=C5LINE, linewidth=2.2, zorder=5)
-ax.legend(handles=[Line2D([0], [0], color=C5LINE, lw=2.2, label="都心5区 区界"),
+ax.legend(handles=[Line2D([0], [0], color=C5LINE, lw=2.2, label="都心5区 外郭"),
                    Patch(facecolor=BASE, edgecolor="white",
                          label="欠損（取引なし/結合不可）")],
           loc="upper left", framealpha=0.9, fontsize=10)
