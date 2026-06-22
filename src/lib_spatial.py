@@ -9,6 +9,28 @@ import geopandas as gpd
 import numpy as np
 import pandas as pd
 
+# --- 町名の表記ゆれ正規化 ----------------------------------------------------
+# 国勢調査shapefileの町名(S_NAME)と物件データ(モデル表)の町名がずれて結合に失敗し、
+# 重心NaN＋孤立ノードになる町があった。物件データ側の表記を正準形とし、shp側を寄せる。
+#   ① ケ/ヶ : 物件表記はすべて「ケ」。shpの「ヶ」(桐ヶ丘/西ヶ原)を「ケ」に統一。
+#   ② 異体字 : 物件表記は旧字。shpの簡体(涛→濤・鴬→鶯)を旧字に戻す。
+# いずれも全23区へ無害（物件側に該当文字が出ないことを確認済み）。
+_NAME_CHAR_MAP = str.maketrans({"ヶ": "ケ", "涛": "濤", "鴬": "鶯"})
+
+# ③ 神田接頭辞の欠落（構造的な別表記。区スコープで対応）。
+#   千代田区の「三崎町/猿楽町」は物件データでは「神田三崎町/神田猿楽町」。
+#   ※渋谷区にも別個の「猿楽町」があるため、区を限定して付け替える。
+_NAME_WARD_ALIAS = {
+    ("千代田区", "三崎町"): "神田三崎町",
+    ("千代田区", "猿楽町"): "神田猿楽町",
+}
+
+
+def normalize_town_name(municipality, name):
+    """shapefile由来の町名を物件データの正準表記に揃える（上記①②③）。"""
+    name = str(name).translate(_NAME_CHAR_MAP)
+    return _NAME_WARD_ALIAS.get((municipality, name), name)
+
 
 def load_town_polygons(shapefile_path, wards, ward_col_candidates=("CITY_NAME", "GST_NAME")):
     """町丁目shapefileを読み込み、23区に絞り、丁目を落として町単位にdissolveする。
@@ -20,11 +42,13 @@ def load_town_polygons(shapefile_path, wards, ward_col_candidates=("CITY_NAME", 
         raise KeyError(f"区名の列が見つかりません。候補: {ward_col_candidates} / 実際: {list(gdf.columns)}")
 
     gdf = gdf[gdf[ward_col].isin(wards)].copy()
-    # 「○丁目」を除去して町名に正規化
+    gdf["Municipality"] = gdf[ward_col]
+    # 「○丁目」を除去 → 物件データ表記へ正規化（表記ゆれ吸収）
     gdf["DistrictName"] = gdf["S_NAME"].apply(
         lambda x: re.sub(r"[一二三四五六七八九十百０-９0-9]+丁目$", "", str(x))
     )
-    gdf["Municipality"] = gdf[ward_col]
+    gdf["DistrictName"] = [normalize_town_name(m, d)
+                           for m, d in zip(gdf["Municipality"], gdf["DistrictName"])]
     # 区またぎで同名の町があり得るので Municipality+DistrictName でdissolve
     dissolved = gdf.dissolve(by=["Municipality", "DistrictName"]).reset_index()
     return dissolved[["Municipality", "DistrictName", "geometry"]]

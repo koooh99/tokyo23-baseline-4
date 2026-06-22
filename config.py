@@ -123,6 +123,54 @@ DEFAULT_LAG_COLS = LAG_CONFIGS_Q[DEFAULT_LAG_NAME]
 DEFAULT_TLAG_COLS = ["Lag_q1_AvgPrice", "Lag_q4_AvgPrice"]      # 自町の過去（時間ラグ）
 DEFAULT_SLAG_COLS = ["S_Lag_q1_AvgPrice", "S_Lag_q4_AvgPrice"]  # 近隣の過去（空間ラグ）
 
+# --- 時空間GNN（09, 最小スタート） ---------------------------------
+# 方針: 04qの町丁目queen隣接(940町)をグラフ化し、各四半期スナップショットに
+#       空間GCNを適用 → 学習した空間表現を物件特徴と結合して平米単価を回帰する。
+#       手作りS-lag（近隣平均）を「グラフ伝播」に置き換えて勝てるかを見る v0。
+# 時間方向は当面 Expanding Window(四半期) で表現し、直近性重視の系列モデルは次段で足す。
+# ノード特徴は町丁目×四半期で持つ自町ラグ（直前1Q/前年同期）＋重心座標。
+GNN_NODE_FEATURES = ["Lag_q1_AvgPrice", "Lag_q4_AvgPrice", "centroid_x", "centroid_y"]
+# 物件側の数値特徴（駅TEは最小版では使わず、グラフの寄与を切り分ける）。
+GNN_PROP_FEATURES = ["Age", "Area_num", "Is_Renovated", "Is_RC", "Rooms",
+                     "FAR_CAR_ratio", "Station_min"]
+# CPUで現実的に回すため、まず直近8四半期(2024Q1〜2025Q4)だけで検証。
+GNN_TEST_QUARTERS = [y * 4 + q for y in range(2024, 2026) for q in range(4)]
+GNN_TRAIN_WINDOW = 12         # 各フォールドで使う直近の訓練四半期数（None=全期間）
+GNN_HIDDEN = 32               # GCN隠れ次元
+GNN_EPOCHS = 40
+GNN_LR = 1e-3
+GNN_DEVICE = "cpu"            # MPSはハングし得るためCPU既定（環境変数 GNN_DEVICE で上書き）
+
+# 空間conv層のセレクタ（TEMPORAL_AGG と対になる空間版, lib_gnn.SPATIAL_CONVS のキー）。
+# "gcn"=対称正規化の等重み平均（既定・既存挙動を一切変えない）、
+# "gat"=GATConv(static attention)、"gatv2"=GATv2Conv(dynamic attention, 推奨)。
+# 09/run_compare は環境変数 SPATIAL_CONV で上書き可。GATは同じedge_index上で辺重みのみ学習する。
+SPATIAL_CONV = "gcn"
+# GAT系1層目のヘッド数。1層目 heads=GAT_HEADS concat=True → hidden*heads、
+# 2層目 heads=1 concat=False → hidden（出力次元をGCN版の hidden に一致させる）。
+GAT_HEADS = 4
+
+# --- 時空間GNN・時間系列版（10, GCN+GRU） --------------------------
+# 各町の「直近LQの観測平米単価系列」を GCN→GRU で集約し、直近性を学習させる。
+# ノード特徴は観測平米単価(前方補完)＋観測フラグ＋重心。系列長は直近性/季節性を
+# 両方カバーするよう既定8四半期(=2年, 前年同期も含む)。
+TEMPORAL_SEQ_LEN = 8          # 時間集約に入れる直近四半期数
+TEMPORAL_EPOCHS = 30          # 四半期ごとにstepする（=エポックあたり訓練四半期数の更新）
+TEMPORAL_LR = 3e-3
+# 時間集約器（lib_temporal.AGGREGATORS のキー）。"gru" が既定挙動（既知値再現）。
+# "attention"=過去Lステップへのsoftmax重み学習（重み[N,L]可視化可）、
+# "mean"/"last"=アブレーション用の単純基準。10は環境変数 TEMPORAL_AGG で上書き可。
+# --- time-aware 注意（①, 15が使う。§6dの一様化が前方補完の artifact か内在かを切り分ける）---
+# "time_attn_gap"=学習した時間ギャップ埋め込みを key に加える加法注意（全Lに注意・
+#   直近を区別する自由度を付与）。"time_attn_obs"=上に加え前方補完(非観測)ステップを
+#   強く減衰し実観測中心に注意を張る（不等間隔系列扱い）。どちらも last_weights[N,L] を
+#   §6d と同形式で出す。既定 TEMPORAL_AGG は変更しない（"gru" のまま）。
+TEMPORAL_AGG = "gru"
+# (c) 公平比較: XGB-full(Qboth) と同じ立地系特徴を物件側ヘッドにも入れる。
+# Station_TE（駅名ターゲットエンコーディング, フォールド内fitでリーク防止）＋
+# Municipality / Zoning の one-hot を結合する。Falseで最小版（グラフ＋物件数値のみ）。
+GNN_RICH_FEATURES = True
+
 # --- 外れ値処理（議事録：慎重に・論文で明示） ----------------------
 # 2段階に分ける：
 #  (A) 決定論的クレンジング … 02で実施。価格0や面積欠損など「あり得ない/計算不能」を除去。

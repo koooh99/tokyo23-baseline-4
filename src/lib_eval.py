@@ -63,11 +63,14 @@ def _r2_pair(g, target, bounds):
 def expanding_window_pooled(df, make_model, features, target, test_years,
                             iqr_trim=True, iqr_k=1.5, iqr_by_ward=True,
                             subgroups=None, fold_transform=None,
-                            progress=True, time_col="Year"):
+                            progress=True, time_col="Year", train_window=None):
     """23区プールの Expanding Window 評価。
     各検証時点 y について「< y を訓練 / == y をテスト」で1モデルを学習し、
     全体・区別・サブグループ別のR²を記録する。
     time_col … 時間軸の列名。年次なら "Year"(既定)、四半期なら "Qidx"(05q が使う)。
+    train_window … 直近Nステップのみ訓練に使う窓幅。None(既定)=全期間=従来のExpanding
+                     挙動（後方互換）。整数Nを渡すと訓練を [y-N, y) に限定する
+                     （GNNの GNN_TRAIN_WINDOW と同条件でXGBを評価する窓実験用）。
     r2      … テストをトリミングしない正直な値（主指標）
     r2_trim … 訓練フォールド由来のIQR閾値をテストにも適用した感度分析値（併記用）
     fold_transform … (train, test)->(train, test)。訓練フォールドのみでfitする
@@ -82,6 +85,8 @@ def expanding_window_pooled(df, make_model, features, target, test_years,
     for i, y in enumerate(test_years, 1):
         d = df.dropna(subset=need)
         tr = d[d[time_col] < y].copy()
+        if train_window:                       # 直近Nステップのみ学習（None=全期間=従来挙動）
+            tr = tr[tr[time_col] >= y - train_window]
         te = d[d[time_col] == y].copy()
         if len(tr) < 200 or len(te) < 50:
             continue
